@@ -308,23 +308,23 @@ def ai_batch_evaluate(jobs_batch):
     {RESUME_SUMMARY}
 
     Below is a numbered list of {len(jobs_batch)} job postings. For EACH one,
-    decide if it's a realistic, worthwhile application for this candidate.
+    decide if it's a realistic, worthwhile application for this entry-level/junior candidate.
 
-    STRICT RULES:
-    1. REJECT (match=false) if the job requires Senior/Lead/Manager/Director level or years of experience.
-    2. ACCEPT (match=true) if it reasonably matches SOC/blue team, incident response, log analysis, threat hunting, network security, vulnerability assessment, SIEM, or junior security roles.
+    RULES:
+    1. REJECT (match=false) ONLY if the job is explicitly Senior, Lead, Principal, Manager, Director, or requires 5+ years of experience, or is unrelated (Sales, HR, Marketing).
+    2. ACCEPT (match=true) if it's Entry-Level, Junior, Intern, Tier 1, or asks for 0-2 years experience in SOC, Blue Team, Incident Response, Log Analysis, Network Security, Vulnerability Assessment, or SIEM.
 
     JOB POSTINGS:
     {listing}
 
-    Return ONLY a raw JSON array (no markdown fences, no commentary), with exactly one object per job IN ORDER:
+    Return ONLY a raw JSON array of objects with no markdown fences:
     [
       {{
         "index": 0,
         "match": true,
         "match_percent": 85,
-        "fit_overview": "One sentence summary of fit.",
-        "cv_tip": "One sentence tip based on candidate tools."
+        "fit_overview": "Good entry-level fit for SOC and network monitoring.",
+        "cv_tip": "Highlight home SOC lab and Wireshark skills."
       }}
     ]
     """
@@ -334,19 +334,20 @@ def ai_batch_evaluate(jobs_batch):
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
+            temperature=0.1
         )
         
         text = response.choices[0].message.content.strip()
         text = re.sub(r"^```(json)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
         
+        # Extract JSON array safely
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
         data = json.loads(text)
-        if isinstance(data, dict) and "jobs" in data:
-            data = data["jobs"]
-        elif isinstance(data, dict) and "results" in data:
-            data = data["results"]
-            
+        
         results = {}
         if isinstance(data, list):
             for item in data:
@@ -391,6 +392,7 @@ def main():
                     f"- {r.get('cv_tip', '')}"
                 )
                 matched_jobs.append(job)
+                print(f"[+] Matched: {job['title']} ({job.get('match_percent', 0)}%)")
                 if len(matched_jobs) >= 5:
                     break
         time.sleep(1)
