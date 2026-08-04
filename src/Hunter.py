@@ -1,518 +1,437 @@
-
 import os
-import re
+import random
 import json
-import html
+import re
 import time
-from pathlib import Path
-from urllib.parse import urlparse
-
+import html
 import requests
+from groq import Groq
 from ddgs import DDGS
 
-ROOT = Path(__file__).resolve().parents[1]
-P = json.loads((ROOT / "profile.json").read_text(encoding="utf-8"))
-QUERIES = json.loads((ROOT / "search_queries.json").read_text(encoding="utf-8"))
-STATE = ROOT / "data" / "seen_jobs.json"
+# استخدام نموذج Llama 3.3 70B السريع والعملاق من Groq
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-S = requests.Session()
-S.headers.update({
-    "User-Agent": "Mozilla/5.0 AI-Job-Hunter/3.1 public-job-discovery"
-})
+MAX_JOBS_TO_EVALUATE = 64  # total candidate jobs considered per run
+EVAL_BATCH_SIZE = 8        # jobs sent to Groq per evaluation call
 
-SEC = [
-    "soc","security operations","cybersecurity","cyber security",
-    "information security","siem","splunk","sentinel","elastic security",
-    "incident response","threat detection","threat intelligence",
-    "network security","firewall","ids","ips","edr","xdr","log analysis",
-    "security monitoring","blue team","vulnerability","security incident",
-    "wireshark","packet analysis"
+RESUME_SUMMARY = """
+Moatez Achouri — Junior SOC Analyst / Cybersecurity Analyst / Blue Team Practitioner.
+Doha, Qatar. Open to relocation and remote work. Available immediately.
+
+Core skills: SOC Tier 1 alert triage/prioritization/escalation, log analysis and
+cross-event correlation, incident response fundamentals, threat detection and
+proactive threat hunting, MITRE ATT&CK framework, IOC analysis and threat intel
+interpretation, network traffic monitoring and anomaly detection, vulnerability
+and risk assessment fundamentals.
+
+Tools: Wireshark, Nmap, Nuclei, VirusTotal, Shodan, GreyNoise, Microsoft Defender
+for Endpoint, Elastic Security, SIEM fundamentals, Kali Linux, Windows/Windows
+Server, Python (log parsing & automation), Bash scripting.
+
+Networking/security concepts: TCP/IP, DNS, HTTP/HTTPS, Firewalls, IDS/IPS,
+vulnerability assessment, basic malware analysis.
+
+Certifications (2026): Cisco Junior Cybersecurity Analyst Career Path, Cisco
+Cybersecurity Defense Analyst Pathway Exam, HackLearn Applied Cybersecurity
+Training. Built a home SOC lab in VMware: 60+ Wireshark packet capture analyses,
+Nmap/Nuclei scans, 40+ simulated alerts triaged and mapped to MITRE ATT&CK,
+incident reports written.
+
+Education: Senior Technician Diploma in Development of Intelligent Systems and
+Industrial Computing (2020); Bac+2 in Computer Networking, ISET Tozeur (2017).
+No prior professional cybersecurity work experience — actively seeking a first
+junior/entry-level role or internship.
+"""
+
+SEARCH_QUERIES = [
+    "junior SOC analyst remote OR Gulf OR Canada OR Europe",
+    "SOC analyst tier 1 entry level hiring",
+    "junior blue team analyst remote",
+    "junior incident response analyst remote",
+    "junior threat hunter entry level",
+    "junior threat intelligence analyst remote",
+    "junior network security engineer remote",
+    "junior vulnerability analyst remote",
+    "entry level SIEM analyst remote",
+    "junior IT security analyst Gulf Europe",
+    "cybersecurity intern python bash scripting",
+    "network administrator junior security",
+    "junior penetration tester entry level remote",
+    "graduate cybersecurity program Gulf Europe Canada",
+    "junior MITRE ATT&CK analyst remote",
 ]
 
-BAD = [
-    "sales","business development","marketing","accountant","accounting",
-    "nurse","patient care","medical assistant","content reviewer",
-    "data labeling","customer success","customer service","recruiter",
-    "human resources","legal","lawyer","finance","copywriter","designer",
-    "teacher","caregiver"
+SECURITY_KEYWORDS = [
+    "cyber", "security", "soc", "siem", "threat", "vulnerabilit",
+    "penetration", "incident response", "network security", "firewall",
+    "malware", "iso 27001", "grc", "compliance", "infosec", "blue team",
+    "ioc", "mitre", "log analysis", "threat hunt", "threat intel"
 ]
 
-JUN = [
-    "junior","entry level","entry-level","graduate","trainee","intern",
-    "internship","apprentice","associate","l1","tier 1","early career",
-    "0-1 year","0-2 years","1-2 years","1 year","2 years"
-]
-
-HIGHEXP = [
-    "3+ years","4+ years","5+ years","6+ years","7+ years","8+ years",
-    "10+ years","3 years","4 years","5 years","6 years","7 years",
-    "8 years","10 years"
+EXCLUDE_TITLE_WORDS = [
+    "sales", "accountant", "nurse", "legal", "hr manager", "director",
+    "senior", "lead", "principal", "marketing", "business development",
+    "content reviewer", "patient care", "recruiter", "account executive"
 ]
 
 
-def norm(x):
-    return re.sub(r"[^a-z0-9+#.]+", " ", (x or "").lower()).strip()
-
-
-def clean(x):
-    x = html.unescape(x or "")
-    x = re.sub(r"<script.*?</script>|<style.*?</style>", " ",
-               x, flags=re.I | re.S)
-    x = re.sub(r"<[^>]+>", " ", x)
-    return re.sub(r"\s+", " ", x).strip()
-
-
-def load_seen():
+def send_telegram_message(message):
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        print("[-] Telegram credentials missing!")
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
-        return set(json.loads(STATE.read_text()).get("urls", []))
-    except Exception:
-        return set()
+        res = requests.post(url, json=payload, timeout=10)
+        print(f"[*] Telegram Response: {res.status_code}")
+        if res.status_code != 200:
+            print(f"[-] Telegram error body: {res.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+        return False
 
 
-def save_seen(urls):
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(
-        json.dumps({"urls": sorted(urls)[-15000:]}, indent=2),
-        encoding="utf-8"
-    )
+def is_aggregator_result(title, url):
+    t = title.lower()
+    aggregator_title_patterns = [
+        r"\d+\s*vacanc", r"\d+\s*jobs?\b", r"jobs? in\b.*-\s*(indeed|linkedin|glassdoor|built in)",
+        r"^jobs?\b", r"job search", r"search results", r"interview questions for",
+        r"salary (guide|report)", r"career (path|guide)",
+    ]
+    if any(re.search(p, t) for p in aggregator_title_patterns):
+        return True
+    aggregator_domains = ["indeed.com/q-", "indeed.com/jobs?q=", "/jobs/search", "/job-search"]
+    if any(d in url.lower() for d in aggregator_domains):
+        return True
+    return False
 
 
-def security_score(job):
-    t = norm(job.get("title", "") + " " + job.get("description", ""))
-    return sum(1 for x in SEC if x in t)
-
-
-def clearly_bad(job):
-    return any(x in norm(job.get("title", "")) for x in BAD)
-
-
-def web_search():
-    out = {}
+def fetch_ddgs_jobs():
+    jobs = []
+    skipped_aggregators = 0
     try:
         with DDGS() as ddgs:
-            for q in QUERIES:
-                print("[search]", q)
+            for q in SEARCH_QUERIES:
+                print(f"[*] DDGS searching: {q}")
                 try:
-                    results = ddgs.text(q, max_results=8)
-                    for r in results:
-                        u = r.get("href") or r.get("url")
-                        if not u or u in out:
-                            continue
-                        out[u] = {
-                            "title": r.get("title", ""),
-                            "company": "Unknown",
-                            "location": "Unknown",
-                            "description": r.get("body", ""),
-                            "url": u,
-                            "source": "Web/" + urlparse(u).netloc
-                        }
-                except Exception as e:
-                    print("search error:", e)
-                time.sleep(0.25)
+                    results = list(ddgs.text(q, max_results=6))
+                except Exception as qe:
+                    print(f"[-] DDGS query failed for '{q}': {qe}")
+                    continue
+                for r in results:
+                    url = r.get("href", "")
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    if not url or not title:
+                        continue
+                    if is_aggregator_result(title, url):
+                        skipped_aggregators += 1
+                        continue
+                    jobs.append({
+                        "title": title,
+                        "company": "Security Employer",
+                        "location": "Global / Remote / Regional",
+                        "description": body if body else title,
+                        "url": url,
+                        "source": "DDGS Search"
+                    })
     except Exception as e:
-        print("DDGS error:", e)
-    return list(out.values())
+        print(f"[-] DDGS Error: {e}")
+    print(f"[*] DDGS: {len(jobs)} jobs ({skipped_aggregators} aggregator pages skipped)")
+    return jobs
 
 
-def api_jobs():
-    out = []
-
-    # Arbeitnow
+def fetch_remotive_jobs():
+    jobs = []
     try:
-        for page in range(1, 4):
-            r = S.get(
-                "https://www.arbeitnow.com/api/job-board-api",
-                params={"page": page}, timeout=20
-            )
-            r.raise_for_status()
-            for x in r.json().get("data", []):
-                out.append({
-                    "title": x.get("title", ""),
-                    "company": x.get("company_name", "Unknown"),
-                    "location": x.get("location", ""),
-                    "description": clean(x.get("description", "")),
-                    "url": x.get("url", ""),
-                    "source": "Arbeitnow",
-                    "visa": x.get("visa_sponsorship", False)
+        res = requests.get("https://remotive.com/api/remote-jobs?limit=100", timeout=10)
+        if res.status_code == 200:
+            for item in res.json().get("jobs", []):
+                jobs.append({
+                    "title": item.get("title"),
+                    "company": item.get("company_name", "Remotive"),
+                    "location": "Remote",
+                    "description": item.get("description", item.get("title")),
+                    "url": item.get("url"),
+                    "source": "Remotive API"
                 })
     except Exception as e:
-        print("Arbeitnow:", e)
+        print(f"[-] Remotive Error: {e}")
+    return jobs
 
-    # Remotive: security-focused searches instead of unrelated software fallback
-    for q in [
-        "cybersecurity", "SOC analyst", "security analyst",
-        "information security", "SIEM", "incident response",
-        "network security", "vulnerability"
-    ]:
-        try:
-            r = S.get(
-                "https://remotive.com/api/remote-jobs",
-                params={"search": q, "limit": 100}, timeout=20
-            )
-            r.raise_for_status()
-            for x in r.json().get("jobs", []):
-                out.append({
-                    "title": x.get("title", ""),
-                    "company": x.get("company_name", "Unknown"),
-                    "location": x.get("candidate_required_location", "Remote"),
-                    "description": clean(x.get("description", "")),
-                    "url": x.get("url", ""),
-                    "source": "Remotive",
-                    "visa": False
-                })
-        except Exception as e:
-            print("Remotive:", e)
 
-    # Jobicy
-    for geo in ["europe", "canada", "australia", "uk", "usa", "emea"]:
-        try:
-            r = S.get(
-                "https://jobicy.com/api/v2/remote-jobs",
-                params={"count": 100, "geo": geo, "industry": "cybersecurity"},
-                timeout=20
-            )
-            r.raise_for_status()
-            for x in r.json().get("jobs", []):
-                out.append({
-                    "title": x.get("jobTitle", ""),
-                    "company": x.get("companyName", "Unknown"),
-                    "location": x.get("jobGeo", "Remote"),
-                    "description": clean(
-                        x.get("jobDescription") or x.get("jobExcerpt", "")
-                    ),
-                    "url": x.get("url", ""),
-                    "source": "Jobicy",
-                    "visa": False
-                })
-        except Exception as e:
-            print("Jobicy:", e)
-
-    # RemoteOK
+def fetch_remoteok_jobs():
+    jobs = []
     try:
-        r = S.get("https://remoteok.com/api", timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        for x in data[1:] if isinstance(data, list) else []:
-            tags = " ".join(x.get("tags") or [])
-            out.append({
-                "title": x.get("position", ""),
-                "company": x.get("company", "Unknown"),
-                "location": x.get("location", "Remote"),
-                "description": clean(x.get("description", "")) + " " + tags,
-                "url": x.get("url", ""),
-                "source": "RemoteOK",
-                "visa": False
-            })
+        headers = {"User-Agent": "Mozilla/5.0 (JobHunterBot)"}
+        res = requests.get("https://remoteok.com/api", headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data:
+                if not isinstance(item, dict) or "position" not in item:
+                    continue
+                jobs.append({
+                    "title": item.get("position"),
+                    "company": item.get("company", "RemoteOK"),
+                    "location": "Remote",
+                    "description": item.get("description", item.get("position", "")),
+                    "url": item.get("url") or f"https://remoteok.com{item.get('slug', '')}",
+                    "source": "RemoteOK API"
+                })
     except Exception as e:
-        print("RemoteOK:", e)
+        print(f"[-] RemoteOK Error: {e}")
+    return jobs
 
-    return out
 
-
-def enrich(job):
+def fetch_arbeitnow_jobs():
+    jobs = []
     try:
-        r = S.get(job["url"], timeout=12)
-        if r.ok:
-            page = clean(r.text)
-            job["description"] = (
-                job.get("description", "") + " " + page[:18000]
-            ).strip()
-    except Exception:
-        pass
-    return job
+        res = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=10)
+        if res.status_code == 200:
+            for item in res.json().get("data", []):
+                jobs.append({
+                    "title": item.get("title"),
+                    "company": item.get("company_name", "Arbeitnow"),
+                    "location": "Remote" if item.get("remote") else item.get("location", "N/A"),
+                    "description": item.get("description", item.get("title", "")),
+                    "url": item.get("url"),
+                    "source": "Arbeitnow API"
+                })
+    except Exception as e:
+        print(f"[-] Arbeitnow Error: {e}")
+    return jobs
 
 
-def fallback_match(job):
-    t = norm(job["title"] + " " + job["description"])
-    sec = security_score(job)
-    junior = any(x in t for x in JUN)
-    senior_reasonable = (
-        "senior" in norm(job["title"])
-        and not any(x in t for x in HIGHEXP)
+def fetch_jobicy_jobs():
+    jobs = []
+    try:
+        res = requests.get("https://jobicy.com/api/v2/remote-jobs?count=50", timeout=10)
+        if res.status_code == 200:
+            for item in res.json().get("jobs", []):
+                jobs.append({
+                    "title": item.get("jobTitle", item.get("title", "")),
+                    "company": item.get("companyName", "Jobicy"),
+                    "location": "Remote",
+                    "description": item.get("jobExcerpt", item.get("jobDescription", "")),
+                    "url": item.get("url"),
+                    "source": "Jobicy API"
+                })
+    except Exception as e:
+        print(f"[-] Jobicy Error: {e}")
+    return jobs
+
+
+def fetch_himalayas_jobs():
+    jobs = []
+    try:
+        res = requests.get("https://himalayas.app/api/jobs?limit=100", timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            items = data.get("jobs", []) if isinstance(data, dict) else data
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                jobs.append({
+                    "title": item.get("title"),
+                    "company": item.get("companyName", item.get("company", "Himalayas")),
+                    "location": "Remote",
+                    "description": item.get("description", item.get("excerpt", item.get("title", ""))),
+                    "url": item.get("applicationLink") or item.get("url"),
+                    "source": "Himalayas API"
+                })
+    except Exception as e:
+        print(f"[-] Himalayas Error: {e}")
+    return jobs
+
+
+def fetch_cybersecurity_jobs():
+    all_jobs = []
+
+    # DDGS search
+    all_jobs.extend(fetch_ddgs_jobs())
+
+    # General APIs with security-keyword filter
+    general_sources = (
+        fetch_remotive_jobs()
+        + fetch_remoteok_jobs()
+        + fetch_arbeitnow_jobs()
+        + fetch_jobicy_jobs()
+        + fetch_himalayas_jobs()
     )
-    if sec >= 2 and (junior or senior_reasonable):
-        return {
-            "decision": "MATCH",
-            "match": min(88, 50 + sec * 5 + (15 if junior else 5)),
-            "level": "junior/intern" if junior else "senior-title-but-reasonable",
-            "experience": "unclear",
-            "remote": "yes" if "remote" in t else "unknown",
-            "sponsorship": "yes" if job.get("visa") else "unknown",
-            "freshness": "unknown",
-            "reason": "Security role with junior/early-career or potentially reasonable requirements.",
-            "cv_tip": "Highlight your Home SOC Lab, alert triage, Wireshark, Nmap/Nuclei and MITRE ATT&CK."
-        }
-    return None
+
+    kept = 0
+    for job in general_sources:
+        title = (job.get("title") or "")
+        desc = (job.get("description") or "")
+        blob = (title + " " + desc).lower()
+        if any(k in blob for k in SECURITY_KEYWORDS):
+            all_jobs.append(job)
+            kept += 1
+
+    print(f"[*] General job boards: {kept}/{len(general_sources)} passed keyword filter")
+
+    # Dedup by URL
+    seen_urls = set()
+    deduped = []
+    for job in all_jobs:
+        url = job.get("url")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            deduped.append(job)
+
+    print(f"[*] Total unique jobs collected: {len(deduped)}")
+    return deduped
 
 
-def ai_match(job):
+def ai_batch_evaluate(jobs_batch):
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("[-] GROQ_API_KEY missing — skipping AI evaluation batch.")
+        return {}
+
+    listing = ""
+    for i, job in enumerate(jobs_batch):
+        desc = (job.get("description") or "")[:400]
+        listing += f"\n[{i}] Title: {job['title']} | Company: {job.get('company','')}\nDescription: {desc}\n"
+
+    prompt = f"""
+    CANDIDATE RESUME:
+    {RESUME_SUMMARY}
+
+    Below is a numbered list of {len(jobs_batch)} job postings. For EACH one,
+    decide if it's a realistic, worthwhile application for this candidate.
+
+    STRICT RULES:
+    1. REJECT (match=false) if the job requires Senior/Lead/Manager/Director level or years of experience.
+    2. ACCEPT (match=true) if it reasonably matches SOC/blue team, incident response, log analysis, threat hunting, network security, vulnerability assessment, SIEM, or junior security roles.
+
+    JOB POSTINGS:
+    {listing}
+
+    Return ONLY a raw JSON array (no markdown fences, no commentary), with exactly one object per job IN ORDER:
+    [
+      {{
+        "index": 0,
+        "match": true,
+        "match_percent": 85,
+        "fit_overview": "One sentence summary of fit.",
+        "cv_tip": "One sentence tip based on candidate tools."
+      }}
+    ]
     """
-    Uses Gemini 2.5 Flash through the REST API.
 
-    Important: the previous version created a new google-genai Client
-    inside every job evaluation. That caused:
-        Cannot send a request, as the client has been closed.
-
-    REST avoids that SDK lifecycle problem.
-    """
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        return fallback_match(job)
-
-    prompt = """You are a STRICT cybersecurity job matching agent.
-
-Candidate:
-%s
-
-JOB TITLE: %s
-COMPANY: %s
-LOCATION: %s
-SOURCE: %s
-JOB DESCRIPTION:
-%s
-
-Rules:
-1. MATCH Junior, Entry Level, Graduate, Trainee, Internship, Apprenticeship,
-   Associate, L1/Tier 1 and Remote cybersecurity/security roles.
-2. Senior/Sr is NOT automatically rejected. Keep it when actual relevant
-   experience is <=2 years, equivalent experience is accepted, or requirements
-   are realistically attainable.
-3. Reject clearly 3+ years of required relevant experience.
-4. Reject unrelated jobs such as sales, marketing, HR, accounting, medical,
-   customer service, data labeling or content moderation.
-5. Never invent sponsorship. "yes" only if explicitly stated; otherwise "unknown".
-6. Home SOC Lab is practical hands-on experience, not paid SOC employment.
-7. Prioritize SOC, SIEM, alert triage, logs, incident response, threat
-   detection, network security, vulnerability analysis, blue team and security automation.
-8. Return ONLY valid JSON.
-
-{
- "decision":"MATCH or REJECT",
- "match":0,
- "level":"intern/junior/associate/senior-title-but-reasonable",
- "experience":"0-1/1-2/2-3/3+/unclear",
- "remote":"yes/no/unknown",
- "sponsorship":"yes/no/unknown",
- "freshness":"new/recent/old/unknown",
- "reason":"one sentence",
- "cv_tip":"one sentence"
-}
-""" % (
-        json.dumps(P, ensure_ascii=False),
-        job["title"],
-        job["company"],
-        job["location"],
-        job["source"],
-        job["description"][:12000]
-    )
-
-    endpoint = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.0-flash:generateContent"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 500,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    for attempt in range(4):
-        try:
-            r = S.post(
-                endpoint,
-                params={"key": key},
-                json=payload,
-                timeout=45
-            )
-
-            if r.status_code == 429:
-                wait = min(60, 10 * (attempt + 1))
-                print("Gemini 429; sleeping", wait, "seconds")
-                time.sleep(wait)
-                continue
-
-            if r.status_code >= 500:
-                wait = min(30, 5 * (attempt + 1))
-                print("Gemini server error", r.status_code,
-                      "; sleeping", wait, "seconds")
-                time.sleep(wait)
-                continue
-
-            if not r.ok:
-                print("Gemini HTTP error:", r.status_code, r.text[:600])
-                return None
-
-            data = r.json()
-            parts = (
-                data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [])
-            )
-            raw = "".join(p.get("text", "") for p in parts).strip()
-            raw = re.sub(r"^```json\s*|\s*```$", "", raw,
-                         flags=re.I).strip()
-
-            result = json.loads(raw)
-            if (
-                result.get("decision") == "MATCH"
-                and int(result.get("match", 0)) >= 60
-            ):
-                return result
-            return None
-
-        except Exception as e:
-            if attempt < 3:
-                wait = 5 * (attempt + 1)
-                print("Gemini retry:", e, "; sleeping", wait, "seconds")
-                time.sleep(wait)
-            else:
-                print("Gemini failed:", e)
-
-    return None
-
-
-def send_telegram(jobs):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
-
-    text = "🛡️ <b>AI Job Hunter v3.1 — New Matches</b>\n\n"
-
-    for i, job in enumerate(jobs, 1):
-        e = job["evaluation"]
-        block = (
-            f"<b>{i}. {html.escape(job['title'])}</b>\n"
-            f"🏢 {html.escape(job['company'])}\n"
-            f"📍 {html.escape(job['location'])}\n"
-            f"🎯 Match: <b>{int(e.get('match', 0))}%</b>\n"
-            f"👤 Level: {html.escape(str(e.get('level', '')))}\n"
-            f"⏳ Experience: {html.escape(str(e.get('experience', '')))}\n"
-            f"🌍 Remote: {html.escape(str(e.get('remote', '')))}\n"
-            f"🛂 Sponsorship: {html.escape(str(e.get('sponsorship', 'unknown')))}\n"
-            f"🆕 Freshness: {html.escape(str(e.get('freshness', 'unknown')))}\n"
-            f"💡 {html.escape(str(e.get('reason', '')))}\n"
-            f"📄 CV tip: {html.escape(str(e.get('cv_tip', '')))}\n"
-            f"🌐 {html.escape(job['source'])}\n"
-            f'🔗 <a href="{html.escape(job["url"], quote=True)}">Apply / View Job</a>\n\n'
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
         )
+        
+        text = response.choices[0].message.content.strip()
+        text = re.sub(r"^```(json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+        
+        data = json.loads(text)
+        if isinstance(data, dict) and "jobs" in data:
+            data = data["jobs"]
+        elif isinstance(data, dict) and "results" in data:
+            data = data["results"]
+            
+        results = {}
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "index" in item:
+                    results[item["index"]] = item
+        return results
 
-        if len(text) + len(block) > 3900:
-            S.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                },
-                timeout=20
-            ).raise_for_status()
-            text = ""
-
-        text += block
-
-    if text:
-        S.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            },
-            timeout=20
-        ).raise_for_status()
-
-
-def candidate_score(job):
-    t = norm(job["title"] + " " + job["description"])
-    score = security_score(job) * 10
-
-    if any(x in t for x in JUN):
-        score += 35
-    if "remote" in t:
-        score += 15
-    if any(x in t for x in ["visa sponsorship", "sponsorship", "relocation"]):
-        score += 10
-    if any(x in norm(job["title"]) for x in [
-        "soc", "security", "cybersecurity", "information security"
-    ]):
-        score += 15
-
-    # Senior gets a small bonus only when no obvious 3+ year requirement exists.
-    if "senior" in norm(job["title"]) and not any(x in t for x in HIGHEXP):
-        score += 8
-
-    return score
+    except Exception as e:
+        print(f"[-] Groq AI Error: {e}")
+        return {}
 
 
 def main():
-    print("=== AI Job Hunter v3.1 ===")
+    print("=== Groq Llama-3.3 AI Job Hunter Started ===")
 
-    seen = load_seen()
-    jobs = api_jobs() + web_search()
+    all_jobs = fetch_cybersecurity_jobs()
+    print(f"[*] Total collected jobs to evaluate: {len(all_jobs)}")
 
-    unique = {
-        j["url"]: j
-        for j in jobs
-        if j.get("url") and j.get("title")
-    }
+    if not all_jobs:
+        send_telegram_message("⚠️ Security Job Hunter ran, but no jobs were found.")
+        return
 
-    candidates = []
-    for job in unique.values():
-        if job["url"] in seen:
-            continue
-        if clearly_bad(job):
-            continue
-        if security_score(job) < 1:
-            continue
-        candidates.append(job)
+    random.shuffle(all_jobs)
+    all_jobs = all_jobs[:MAX_JOBS_TO_EVALUATE]
+    all_jobs = [j for j in all_jobs if not any(w in (j.get("title") or "").lower() for w in EXCLUDE_TITLE_WORDS)]
+    print(f"[*] Evaluating {len(all_jobs)} jobs with Groq AI in batches of {EVAL_BATCH_SIZE}")
 
-    candidates.sort(key=candidate_score, reverse=True)
+    matched_jobs = []
+    for start in range(0, len(all_jobs), EVAL_BATCH_SIZE):
+        if len(matched_jobs) >= 5:
+            break
+        batch = all_jobs[start:start + EVAL_BATCH_SIZE]
+        results = ai_batch_evaluate(batch)
+        for i, job in enumerate(batch):
+            r = results.get(i)
+            if r and r.get("match"):
+                job["match_percent"] = r.get("match_percent", 0)
+                job["evaluation"] = (
+                    f"MATCH_PERCENT: {r.get('match_percent', 0)}%\n"
+                    f"ASSESSMENT:\n"
+                    f"- {r.get('fit_overview', '')}\n"
+                    f"- {r.get('cv_tip', '')}"
+                )
+                matched_jobs.append(job)
+                if len(matched_jobs) >= 5:
+                    break
+        time.sleep(1)
 
-    print("unique:", len(unique))
-    print("new security candidates:", len(candidates))
+    if not matched_jobs:
+        print("[-] No matching cybersecurity entry-level jobs found.")
+        send_telegram_message("⚠️ Security Job Hunter ran, but all jobs were filtered out by AI match.")
+        return
 
-    matches = []
-    evaluated = set()
+    message_blocks = []
+    for i, job in enumerate(matched_jobs, 1):
+        block = (
+            f"<b>{i}. {html.escape(str(job['title']))}</b>\n"
+            f"🏢 Company: {html.escape(str(job['company']))}\n"
+            f"📍 Location: {html.escape(str(job['location']))}\n"
+            f"🌐 Source: {html.escape(str(job['source']))}\n"
+            f"🤖 AI Match: {job.get('match_percent', 0)}%\n"
+            f'🔗 <a href="{html.escape(str(job["url"]), quote=True)}">Apply Here</a>\n\n'
+        )
+        message_blocks.append(block)
 
-    # Do not burn the free API quota on hundreds of weak results.
-    # We rank first, then deeply evaluate the best 100.
-    MAX_AI_EVAL = 100
+    header = "🛡️ <b>Cybersecurity & SOC Job Opportunities (Groq Powered)</b> 🛡️\n\n"
+    chunks = []
+    current = header
+    for block in message_blocks:
+        if len(current) + len(block) > 3800:
+            chunks.append(current)
+            current = ""
+        current += block
+    if current.strip():
+        chunks.append(current)
 
-    for idx, job in enumerate(candidates[:MAX_AI_EVAL], 1):
-        print(f"[AI {idx}/{min(MAX_AI_EVAL, len(candidates))}] {job['title']}")
-        job = enrich(job)
-        result = ai_match(job)
-        evaluated.add(job["url"])
+    all_sent = True
+    for chunk in chunks:
+        if not send_telegram_message(chunk):
+            all_sent = False
 
-        if result:
-            job["evaluation"] = result
-            matches.append(job)
-
-        # Conservative pacing. Active Gemini limits vary by project.
-        if idx < MAX_AI_EVAL:
-            time.sleep(6)
-
-    matches.sort(
-        key=lambda x: int(x["evaluation"].get("match", 0)),
-        reverse=True
-    )
-
-    save_seen(seen | evaluated)
-
-    print("AI matches:", len(matches))
-
-    if matches:
-        send_telegram(matches[:12])
-        print("Telegram: sent", min(12, len(matches)), "matches")
+    if all_sent:
+        print("[+] Results successfully sent to Telegram!")
     else:
-        print("No new qualifying matches.")
+        print("[-] Telegram delivery failed.")
 
 
 if __name__ == "__main__":
